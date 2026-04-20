@@ -1,0 +1,63 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: np
+      POSTGRES_PASSWORD: np
+      POSTGRES_DB: newspaper
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U np -d newspaper"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  searxng:
+    image: searxng/searxng:latest
+    restart: unless-stopped
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      BASE_URL: http://localhost:8890/
+      INSTANCE_NAME: newspaper-local
+    ports:
+      - "8890:8080"
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://np:np@db:5432/newspaper
+      SEARXNG_URL: http://searxng:8080
+      OLLAMA_MODEL: qwen3:14b
+    depends_on:
+      db:
+        condition: service_healthy
+      searxng:
+        condition: service_started
+    volumes:
+      - ./backend:/app
+      - ./issues:/app/issues
+    ports:
+      - "8000:8000"
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  ui:
+    build: ./ui
+    restart: unless-stopped
+    volumes:
+      - ./ui:/app
+      - /app/node_modules
+    ports:
+      - "5173:5173"
+    command: npm run dev -- --host 0.0.0.0
+    depends_on:
+      - backend
+
+volumes:
+  db_data:

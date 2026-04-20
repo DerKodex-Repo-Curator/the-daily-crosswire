@@ -1,0 +1,95 @@
+# ---------- Env / secrets ----------
+.env
+.env.*.local
+.env.local
+*.pem
+*.key
+*.pfx
+
+# ---------- Local / private design + agent context ----------
+# CLAUDE.md, AGENTS.md, and the various .claude / .cursor / .aider
+# configs are local-authoring aids that shouldn't ship in a public repo.
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+.claude/
+.cursor/
+.cursorrules
+.aider*
+.windsurfrules
+
+# vibedocs carry internal design decisions + incident reports (e.g.
+# vibedocs/reports/*.md). Keep private.
+vibedocs/
+
+# ---------- Generated newspaper output ----------
+issues/*
+!issues/.gitkeep
+
+# ---------- Legacy single-paper + stray CLI / build artifacts ----------
+# The root-level single-paper (index.html + app.js + build_puzzles.py +
+# style.css) is the original standalone newspaper that predates the web
+# app. The web app generates fresh per-issue output under
+# issues/{slug}/, and ships its own canonical style.css at
+# backend/app/templates/style.css. The legacy files are kept locally
+# for the original CLI workflow but not shipped publicly.
+/index.html
+/app.js
+/build_puzzles.py
+/style.css
+_games_fragment.html
+
+# ---------- Python ----------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# ---------- Node / frontend ----------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.yarn/
+*.tgz
+ui/dist/
+ui/.vite/
+
+# ---------- Binaries / compiled ----------
+*.so
+*.pyd
+*.dll
+*.dylib
+*.exe
+*.class
+*.o
+*.a
+
+# ---------- Editors / OS ----------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.#*
+\#*\#
+
+# ---------- Misc ----------
+*.log
+.tmp/
+tmp/

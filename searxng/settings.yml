@@ -1,0 +1,25 @@
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "newspaper-local"
+
+server:
+  secret_key: "fd698679f67f73b8d9c5c5941bb6c142e558594479c1aa6ddad51c43a20b757c"
+  limiter: false
+  image_proxy: false
+  bind_address: "0.0.0.0"
+  port: 8080
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  formats:
+    - html
+    - json
+
+ui:
+  static_use_hash: true
+
+redis:
+  url: false

@@ -1,0 +1,11 @@
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+# Auto-generated Alembic revision files keep their own quirky style;
+# exclude them so Black doesn't rewrite migrations into churn.
+extend-exclude = '''
+(
+    alembic/versions
+  | \.venv
+)
+'''

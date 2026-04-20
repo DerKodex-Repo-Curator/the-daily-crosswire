@@ -1,0 +1,21 @@
+fastapi
+uvicorn[standard]
+sqlmodel
+psycopg[binary]
+pgvector
+alembic
+pydantic-settings
+feedparser
+apscheduler
+httpx
+openai
+langchain-core
+langchain-openai
+langchain-ollama
+langgraph
+pytest
+pytest-asyncio
+jinja2
+
+# Dev tooling
+black
