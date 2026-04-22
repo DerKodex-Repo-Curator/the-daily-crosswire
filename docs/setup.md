@@ -238,6 +238,40 @@ at image-build time in `backend/Dockerfile`. The backend image grows by
 ~400 MB. Acceptable for a single-user local stack; ignore if you don't
 run the newsletter.
 
+## Developer setup (pre-commit hooks)
+
+Format and lint checks are enforced at commit time via
+[pre-commit](https://pre-commit.com/). One-time install per clone:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+From then on, every `git commit` runs:
+
+- **Black** on `backend/**/*.py` (line length 100, matches
+  `backend/pyproject.toml`). Auto-rewrites in place; the hook fails the
+  commit if it changed anything, so you re-stage and commit again.
+- **Prettier** on `ui/**`, in `--check` mode (report only, no rewrite).
+  Run `npm --prefix ui run format` to fix violations before retrying.
+- **ESLint** on `ui/**/*.{js,jsx}`, zero warnings allowed.
+
+Run against every file in the repo on demand:
+
+```bash
+pre-commit run --all-files
+```
+
+Both Prettier and ESLint invoke the versions pinned in
+`ui/package-lock.json` (via `npx --no-install`), so the hooks stay in
+lockstep with what `npm run format` / `npm run lint` do locally. Run
+`npm install` inside `ui/` first if you haven't already; the hooks
+refuse to auto-download packages on you.
+
+Contributors who only touch backend Python don't need Node: the two UI
+hooks only fire when you stage a file under `ui/`.
+
 ## Ongoing behavior
 
 - **The global RSS poller** (APScheduler) runs every hour and refreshes all

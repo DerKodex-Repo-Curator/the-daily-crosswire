@@ -1,0 +1,46 @@
+# Pre-commit hooks for The Daily Crosswire.
+#
+# Install once per clone:
+#     pip install pre-commit
+#     pre-commit install
+#
+# Run on demand against every file in the repo:
+#     pre-commit run --all-files
+#
+# Hooks:
+#   - Black on backend Python (except alembic/versions/, which are
+#     auto-generated and keep their own quirky style).
+#   - Prettier on the UI subtree (uses the version pinned in
+#     ui/package-lock.json so local and hook stay in sync).
+#   - ESLint on UI .js/.jsx files, flat-config aware, zero warnings.
+
+repos:
+  - repo: https://github.com/psf/black-pre-commit-mirror
+    rev: 25.1.0
+    hooks:
+      - id: black
+        args: [--line-length=100]
+        files: ^backend/.*\.py$
+        exclude: ^backend/alembic/versions/
+
+  - repo: local
+    hooks:
+      - id: prettier
+        name: prettier (ui)
+        # Runs `npx --no-install prettier --check .` inside ui/. The
+        # --no-install flag refuses to auto-download; contributors must
+        # have already run `npm install` in ui/ (which the setup docs
+        # already require to run the dev server anyway).
+        entry: bash -c 'cd ui && npx --no-install prettier --check .'
+        language: system
+        pass_filenames: false
+        files: ^ui/
+        exclude: ^ui/(node_modules|dist|package-lock\.json)
+
+      - id: eslint
+        name: eslint (ui)
+        entry: bash -c 'cd ui && npx --no-install eslint .'
+        language: system
+        pass_filenames: false
+        files: ^ui/.*\.(js|jsx)$
+        exclude: ^ui/(node_modules|dist)
