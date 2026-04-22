@@ -5,6 +5,7 @@ psycopg[binary]
 pgvector
 alembic
 pydantic-settings
+email-validator
 feedparser
 apscheduler
 httpx
@@ -13,8 +14,11 @@ langchain-core
 langchain-openai
 langchain-ollama
 langgraph
+aiosmtplib
+playwright
 pytest
 pytest-asyncio
+aiosmtpd
 jinja2
 
 # Dev tooling

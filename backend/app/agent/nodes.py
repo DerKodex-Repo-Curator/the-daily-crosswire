@@ -29,9 +29,11 @@ from app.db import engine
 from app.models import NewsItem, NewspaperConfig, RSSFeed, Topic
 from app.services import dedup as dedup_service
 from app.services import embeddings as emb_service
+from app.services import log_buffer
 from app.services import searxng as searxng_service
 from app.services.rss import normalize_title, poll_feed
 from app.agent import prompts
+from app.agent.checkpoint import checkpoint_meta
 from app.agent.languages import hype_words, language_name
 from app.agent.llm import (
     LLMUnavailable,
@@ -320,6 +322,8 @@ async def ingest_search(state: AgentState, min_per_topic: int = 3) -> AgentState
                         "source_domain": (url.split("/")[2] if "://" in url else None),
                         "published_at": _parse_searxng_published(r.get("published_date")),
                         "topic_id": topic.id,
+                        "ingested_via": "searxng",
+                        "source_query": query,
                     }
                 )
 
@@ -520,12 +524,21 @@ async def _select_chunk(
 def _snapshot_news_item(n: NewsItem) -> dict:
     """Denormalized copy of the fields we want to show in a drop trace. Kept
     inline in drafts_json.meta so drops survive even if the source
-    news_items row gets garbage-collected later."""
+    news_items row gets garbage-collected later.
+
+    `ingested_via` + `source_feed_url` / `source_query` drive the drop
+    card's "via RSS:..." / "via SearXNG:..." line. Legacy news_items rows
+    (pre-source-tracking) have these as None; the UI renders nothing for
+    those cases."""
     return {
         "title": (n.title or "")[:200],
         "url": n.url or "",
         "source_domain": n.source_domain or "",
         "summary": (n.summary or "")[:300],
+        "published_at": n.published_at.isoformat() if n.published_at else None,
+        "ingested_via": n.ingested_via,
+        "source_feed_url": n.source_feed_url,
+        "source_query": n.source_query,
     }
 
 
@@ -731,6 +744,20 @@ def _cosine(a, b) -> float:
     return dot / (na**0.5 * nb**0.5)
 
 
+def _checkpoint_progress(state: AgentState) -> None:
+    """Flush the current meta snapshot + durable log tail. Used at sub-step
+    boundaries inside LLM-heavy nodes so the live dashboard sees per-topic /
+    per-story progress and logs survive an in-memory buffer eviction."""
+    if not isinstance(state, dict):
+        return
+    issue_id = state.get("issue_id")
+    if not issue_id:
+        return
+    meta = state.get("meta") or {}
+    checkpoint_meta(issue_id, meta)
+    log_buffer.flush_to_db(issue_id)
+
+
 async def select_stories(state: AgentState) -> AgentState:
     from app.config import settings
 
@@ -755,15 +782,62 @@ async def select_stories(state: AgentState) -> AgentState:
         kept_ids = set(state.get("kept_ids", []))
         config = s.get(NewspaperConfig, _uuid(state["config_id"]))
 
-        for topic in topics:
+        # Initialize live progress for the dashboard. per_topic starts with
+        # one "pending" entry per topic; each gets flipped to running/done
+        # as we iterate. Sub-step updates (current_batch, current_phase)
+        # land on meta['select']['progress'] and checkpoint after each write.
+        meta_select = state.setdefault("meta", {}).setdefault("select", {})
+        progress = meta_select["progress"] = {
+            "topics_total": len(topics),
+            "topics_done": 0,
+            "current_topic_id": None,
+            "current_topic_name": None,
+            "current_topic_index": 0,
+            "current_phase": None,
+            "current_batch": 0,
+            "current_batch_total": 0,
+            "phase_started_at": None,
+            "per_topic": [
+                {"topic_id": str(t.id), "topic_name": t.name, "status": "pending"} for t in topics
+            ],
+        }
+        _checkpoint_progress(state)
+
+        for topic_index, topic in enumerate(topics, start=1):
             candidates = s.exec(
                 select(NewsItem)
                 .where(NewsItem.topic_id == topic.id)
                 .where(NewsItem.id.in_([_uuid(i) for i in kept_ids]))
             ).all()
+
+            # Mark this topic's per_topic row as running for the UI.
+            for row in progress["per_topic"]:
+                if row.get("topic_id") == str(topic.id):
+                    row["status"] = "running"
+                    break
+            progress["current_topic_id"] = str(topic.id)
+            progress["current_topic_name"] = topic.name
+            progress["current_topic_index"] = topic_index
+            progress["current_phase"] = None
+            progress["current_batch"] = 0
+            progress["current_batch_total"] = 0
+            progress["phase_started_at"] = now_utc().isoformat()
+            _checkpoint_progress(state)
+
             if not candidates:
+                for row in progress["per_topic"]:
+                    if row.get("topic_id") == str(topic.id):
+                        row["status"] = "done"
+                        row["candidates"] = 0
+                        row["batches"] = 0
+                        row["kept"] = 0
+                        row["elapsed_ms"] = 0
+                        break
+                progress["topics_done"] += 1
+                _checkpoint_progress(state)
                 continue
 
+            topic_t0 = time.perf_counter()
             keep_ordered: list[str] = []
             seen_keep: set[str] = set()
             lead: Optional[str] = None
@@ -771,6 +845,22 @@ async def select_stories(state: AgentState) -> AgentState:
 
             for batch_idx in range(n_batches):
                 chunk = candidates[batch_idx * batch_size : (batch_idx + 1) * batch_size]
+
+                progress["current_phase"] = "batch"
+                progress["current_batch"] = batch_idx + 1
+                progress["current_batch_total"] = n_batches
+                progress["phase_started_at"] = now_utc().isoformat()
+                _checkpoint_progress(state)
+                logger.info(
+                    "agent select: topic=%r (%d/%d) batch %d/%d start (candidates=%d)",
+                    topic.name,
+                    topic_index,
+                    len(topics),
+                    batch_idx + 1,
+                    n_batches,
+                    len(chunk),
+                )
+                batch_t0 = time.perf_counter()
 
                 try:
                     result = await _select_chunk(llm, topic.name, chunk, state=state)
@@ -845,6 +935,19 @@ async def select_stories(state: AgentState) -> AgentState:
                         snapshot=_snapshot_news_item(c),
                     )
 
+                batch_elapsed = time.perf_counter() - batch_t0
+                logger.info(
+                    "agent select: topic=%r (%d/%d) batch %d/%d kept=%d elapsed=%.1fs",
+                    topic.name,
+                    topic_index,
+                    len(topics),
+                    batch_idx + 1,
+                    n_batches,
+                    len(accepted_this_batch),
+                    batch_elapsed,
+                )
+                _checkpoint_progress(state)
+
             # Fallback: if no batch flagged a lead, promote the first kept item.
             if lead is None and keep_ordered:
                 lead = keep_ordered[0]
@@ -871,6 +974,19 @@ async def select_stories(state: AgentState) -> AgentState:
             dedup_by_id = {str(n.id): n for n in dedup_meta_rows}
 
             if len(keep_ordered) >= 2:
+                progress["current_phase"] = "intra_dedup_llm"
+                progress["current_batch"] = 0
+                progress["current_batch_total"] = 0
+                progress["phase_started_at"] = now_utc().isoformat()
+                _checkpoint_progress(state)
+                logger.info(
+                    "agent select: topic=%r (%d/%d) intra-dedup (llm) start",
+                    topic.name,
+                    topic_index,
+                    len(topics),
+                )
+                dedup_t0 = time.perf_counter()
+
                 items_for_llm = [
                     (
                         nid,
@@ -901,6 +1017,20 @@ async def select_stories(state: AgentState) -> AgentState:
                         )
                     keep_ordered = [nid for nid in keep_ordered if nid not in drop_set]
 
+                logger.info(
+                    "agent select: topic=%r (%d/%d) intra-dedup (llm) dropped=%d elapsed=%.1fs",
+                    topic.name,
+                    topic_index,
+                    len(topics),
+                    len(drop_ids or []),
+                    time.perf_counter() - dedup_t0,
+                )
+                _checkpoint_progress(state)
+
+            progress["current_phase"] = "intra_dedup_emb"
+            progress["phase_started_at"] = now_utc().isoformat()
+            _checkpoint_progress(state)
+
             keep_ordered, collapsed = await _collapse_similar_embeddings(
                 s,
                 keep_ordered,
@@ -924,6 +1054,13 @@ async def select_stories(state: AgentState) -> AgentState:
                         reason=f"near-duplicate of {kept_id} (sim={sim:.3f})",
                         snapshot=_snapshot_news_item(n) if n else None,
                     )
+            logger.info(
+                "agent select: topic=%r (%d/%d) intra-dedup (emb) dropped=%d",
+                topic.name,
+                topic_index,
+                len(topics),
+                len(collapsed or []),
+            )
 
             if lead and lead not in keep_ordered:
                 lead = keep_ordered[0] if keep_ordered else None
@@ -961,6 +1098,7 @@ async def select_stories(state: AgentState) -> AgentState:
                 "has_lead": bool(lead),
             }
 
+            topic_elapsed_ms = int((time.perf_counter() - topic_t0) * 1000)
             logger.info(
                 "agent select: topic=%r candidates=%d batches=%d kept=%d collapsed=%d lead=%s",
                 topic.name,
@@ -970,6 +1108,27 @@ async def select_stories(state: AgentState) -> AgentState:
                 before_count - len(keep_ordered),
                 "yes" if lead else "no",
             )
+
+            for row in progress["per_topic"]:
+                if row.get("topic_id") == str(topic.id):
+                    row["status"] = "done"
+                    row["candidates"] = len(candidates)
+                    row["batches"] = n_batches
+                    row["kept"] = len(keep_ordered)
+                    row["elapsed_ms"] = topic_elapsed_ms
+                    break
+            progress["topics_done"] += 1
+            progress["current_phase"] = None
+            progress["current_batch"] = 0
+            progress["current_batch_total"] = 0
+            progress["phase_started_at"] = None
+            _checkpoint_progress(state)
+
+        # All topics done. Clear the "currently processing" fields so the
+        # UI renders the final per_topic list without an orphan active row.
+        progress["current_topic_id"] = None
+        progress["current_topic_name"] = None
+        progress["current_topic_index"] = 0
 
     state["selected_by_topic"] = selected_by_topic
     state["lead_by_topic"] = lead_by_topic
@@ -1023,6 +1182,20 @@ async def draft(state: AgentState) -> AgentState:
     attempted = 0
     failures = 0
 
+    # Count how many stories draft will process across all topics so the UI
+    # can render "Story 3/23" without walking state itself.
+    stories_total = sum(len(ids) for ids in (state.get("selected_by_topic") or {}).values())
+    meta_draft = state.setdefault("meta", {}).setdefault("draft", {})
+    progress = meta_draft["progress"] = {
+        "stories_total": stories_total,
+        "stories_done": 0,
+        "current_story_index": 0,
+        "current_topic_name": None,
+        "current_title": None,
+        "story_started_at": None,
+    }
+    _checkpoint_progress(state)
+
     with Session(engine) as s:
         config = s.get(NewspaperConfig, _uuid(state["config_id"]))
         lang_code = getattr(config, "language", "en") if config else "en"
@@ -1044,6 +1217,19 @@ async def draft(state: AgentState) -> AgentState:
 
             for item in items:
                 attempted += 1
+                progress["current_story_index"] = attempted
+                progress["current_topic_name"] = topic.name
+                progress["current_title"] = (item.title or "")[:80]
+                progress["story_started_at"] = now_utc().isoformat()
+                _checkpoint_progress(state)
+                logger.info(
+                    "agent draft: story %d/%d (topic=%r) start",
+                    attempted,
+                    stories_total,
+                    topic.name,
+                )
+                story_t0 = time.perf_counter()
+
                 user_msg = prompts.DRAFT_INSTRUCTION.format(
                     topic_name=topic.name,
                     title=item.title or "",
@@ -1067,6 +1253,14 @@ async def draft(state: AgentState) -> AgentState:
                         state,
                         f"draft LLM failed for {item.id} ({type(exc).__name__}): {exc}. Skipping item.",
                     )
+                    logger.info(
+                        "agent draft: story %d/%d failed in %.1fs",
+                        attempted,
+                        stories_total,
+                        time.perf_counter() - story_t0,
+                    )
+                    progress["stories_done"] += 1
+                    _checkpoint_progress(state)
                     continue
 
                 drafts.append(
@@ -1081,13 +1275,29 @@ async def draft(state: AgentState) -> AgentState:
                         original_url=item.url,
                     )
                 )
+                logger.info(
+                    "agent draft: story %d/%d succeeded in %.1fs",
+                    attempted,
+                    stories_total,
+                    time.perf_counter() - story_t0,
+                )
+                progress["stories_done"] += 1
+                _checkpoint_progress(state)
+
+    progress["current_story_index"] = 0
+    progress["current_topic_name"] = None
+    progress["current_title"] = None
+    progress["story_started_at"] = None
+    _checkpoint_progress(state)
 
     state["drafts"] = drafts
-    state.setdefault("meta", {})["draft"] = {
-        "attempted": attempted,
-        "succeeded": len(drafts),
-        "failures": failures,
-    }
+    meta_draft.update(
+        {
+            "attempted": attempted,
+            "succeeded": len(drafts),
+            "failures": failures,
+        }
+    )
     logger.info("agent draft: %d drafts produced", len(drafts))
     return state
 
@@ -1170,6 +1380,16 @@ async def critique(state: AgentState) -> AgentState:
     flagged = 0
     failures = 0
 
+    meta_critique = state.setdefault("meta", {}).setdefault("critique", {})
+    progress = meta_critique["progress"] = {
+        "drafts_total": len(drafts),
+        "drafts_checked": 0,
+        "rewrites_done": 0,
+        "current_draft_index": 0,
+        "current_phase": None,
+    }
+    _checkpoint_progress(state)
+
     with Session(engine) as s:
         config = s.get(NewspaperConfig, _uuid(state["config_id"]))
     lang_code = getattr(config, "language", "en") if config else "en"
@@ -1179,10 +1399,21 @@ async def critique(state: AgentState) -> AgentState:
         # temperature=0 on critique: the rewrite should sharpen predictably,
         # not introduce fresh variation on top of an already-flagged body.
         llm = get_structured_llm(_CritiqueOutput, temperature=0)
-        for d in drafts:
+        for idx, d in enumerate(drafts, start=1):
+            progress["current_draft_index"] = idx
+            progress["current_phase"] = "check"
+            _checkpoint_progress(state)
+
             if not _has_voice_violation(d.get("body", ""), lang_code):
+                progress["drafts_checked"] += 1
+                logger.info("agent critique: draft %d/%d clean (no rewrite)", idx, len(drafts))
+                _checkpoint_progress(state)
                 continue
             flagged += 1
+            progress["current_phase"] = "rewrite"
+            _checkpoint_progress(state)
+            logger.info("agent critique: draft %d/%d rewrite required", idx, len(drafts))
+            rewrite_t0 = time.perf_counter()
             user_msg = prompts.CRITIQUE_INSTRUCTION.format(
                 body=d.get("body", ""),
                 language_name=lang_name,
@@ -1197,17 +1428,32 @@ async def critique(state: AgentState) -> AgentState:
                 if out.needs_rewrite:
                     d["body"] = out.body.strip()
                     rewrites += 1
+                    progress["rewrites_done"] = rewrites
+                logger.info(
+                    "agent critique: draft %d/%d rewrite completed in %.1fs",
+                    idx,
+                    len(drafts),
+                    time.perf_counter() - rewrite_t0,
+                )
             except LLM_CATCHABLE as exc:
                 failures += 1
                 _warn(state, f"critique LLM failed ({type(exc).__name__}): {exc}")
+            progress["drafts_checked"] += 1
+            _checkpoint_progress(state)
 
-    state.setdefault("meta", {})["critique"] = {
-        "checked": len(drafts),
-        "flagged": flagged,
-        "rewrites": rewrites,
-        "failures": failures,
-        "llm": llm_available,
-    }
+    progress["current_draft_index"] = 0
+    progress["current_phase"] = None
+    _checkpoint_progress(state)
+
+    meta_critique.update(
+        {
+            "checked": len(drafts),
+            "flagged": flagged,
+            "rewrites": rewrites,
+            "failures": failures,
+            "llm": llm_available,
+        }
+    )
     logger.info("agent critique: %d rewrites (llm=%s)", rewrites, llm_available)
     return state
 
@@ -1224,6 +1470,7 @@ async def editorial(state: AgentState) -> AgentState:
     meta_ed = state.setdefault("meta", {}).setdefault("editorial", {})
     if not chat_llm_configured() or not state.get("drafts"):
         meta_ed["status"] = "skipped"
+        meta_ed["progress"] = {"status": "skipped", "started_at": None, "topics_count": 0}
         return state
 
     leads: list[str] = []
@@ -1248,7 +1495,17 @@ async def editorial(state: AgentState) -> AgentState:
     if not leads:
         meta_ed["status"] = "skipped"
         meta_ed["reason"] = "no leads"
+        meta_ed["progress"] = {"status": "skipped", "started_at": None, "topics_count": 0}
         return state
+
+    progress = meta_ed["progress"] = {
+        "status": "running",
+        "started_at": now_utc().isoformat(),
+        "topics_count": len(topic_names),
+    }
+    _checkpoint_progress(state)
+    logger.info("agent editorial: start (%d topics)", len(topic_names))
+    editorial_t0 = time.perf_counter()
 
     llm = get_structured_llm(_EditorialOutput)
     user_msg = prompts.EDITORIAL_INSTRUCTION.format(
@@ -1266,10 +1523,25 @@ async def editorial(state: AgentState) -> AgentState:
         state["editorial"] = out.editorial.strip()
         meta_ed["status"] = "ok"
         meta_ed["word_count"] = len(state["editorial"].split())
+        progress["status"] = "done"
+        logger.info(
+            "agent editorial: ok in %.1fs (%d words)",
+            time.perf_counter() - editorial_t0,
+            meta_ed["word_count"],
+        )
     except LLM_CATCHABLE as exc:
         meta_ed["status"] = "failed"
         meta_ed["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+        progress["status"] = "failed"
         _warn(state, f"editorial LLM failed ({type(exc).__name__}): {exc}")
+        logger.info(
+            "agent editorial: failed in %.1fs",
+            time.perf_counter() - editorial_t0,
+        )
+    # Flush the terminal status (done or failed) so the dashboard sees
+    # the outcome immediately rather than waiting for the puzzles node's
+    # entry checkpoint.
+    _checkpoint_progress(state)
 
     return state
 
@@ -1416,4 +1688,83 @@ async def render(state: AgentState) -> AgentState:
     except Exception as exc:
         _warn(state, f"render failed: {exc}")
         # Don't re-raise: finalize already persisted drafts_json, issue stays 'drafted'.
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Node 12: notify: email the generated PDF to config.newsletter_emails.
+# Runs last so it only fires when the issue is actually 'ready'. A failed
+# notify does not flip issue status; the newspaper is already published.
+
+
+async def notify(state: AgentState) -> AgentState:
+    from app.models import Issue
+
+    meta_notify = state.setdefault("meta", {}).setdefault("notify", {})
+
+    with Session(engine) as s:
+        config = s.get(NewspaperConfig, _uuid(state["config_id"]))
+        issue = s.get(Issue, _uuid(state["issue_id"]))
+        recipients = list(config.newsletter_emails) if config else []
+        paper_name = config.name if config else "The Daily Crosswire"
+        language = config.language if config else "en"
+        slug = issue.slug if issue else None
+        status_now = issue.status if issue else None
+        issue_date = issue.issue_date if issue else None
+
+    if not recipients:
+        meta_notify.update({"status": "skipped", "reason": "no subscribers"})
+        logger.info("agent notify: skipped (no subscribers)")
+        return state
+
+    if status_now != "ready" or not slug:
+        meta_notify.update({"status": "skipped", "reason": "issue not ready"})
+        logger.info("agent notify: skipped (issue not ready, status=%s)", status_now)
+        return state
+
+    if not settings.smtp_configured:
+        meta_notify.update({"status": "misconfigured"})
+        logger.warning(
+            "agent notify: SMTP not configured; skipping send to %d recipient(s)",
+            len(recipients),
+        )
+        return state
+
+    try:
+        from app.services import pdf as pdf_service
+        from app.services import mail as mail_service
+
+        pdf_bytes = await pdf_service.build_issue_pdf(slug)
+    except Exception as exc:
+        meta_notify.update({"status": "failed", "error": f"{type(exc).__name__}: {str(exc)[:200]}"})
+        _warn(state, f"notify PDF generation failed: {type(exc).__name__}: {exc}")
+        return state
+
+    payload = mail_service.build_issue_email(
+        paper_name=paper_name,
+        issue_date=issue_date,
+        language=language,
+        slug=slug,
+        pdf_bytes=pdf_bytes,
+        kind="auto",
+    )
+
+    try:
+        outcomes = await mail_service.send_issue(recipients, payload)
+    except Exception as exc:
+        meta_notify.update({"status": "failed", "error": f"{type(exc).__name__}: {str(exc)[:200]}"})
+        _warn(state, f"notify SMTP send failed: {type(exc).__name__}: {exc}")
+        return state
+
+    sent = sum(1 for o in outcomes if o.get("status") == "ok")
+    failed = sum(1 for o in outcomes if o.get("status") == "failed")
+    meta_notify.update(
+        {
+            "status": "ok" if failed == 0 else "partial",
+            "sent": sent,
+            "failed": failed,
+            "per_recipient": outcomes,
+        }
+    )
+    logger.info("agent notify: sent=%d failed=%d", sent, failed)
     return state

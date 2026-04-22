@@ -48,4 +48,6 @@ export const api = {
   getIssueLogs: (id, since) =>
     request(`/api/issues/${id}/logs${since ? `?since=${encodeURIComponent(since)}` : ""}`),
   triggerGenerate: (configId) => request(`/api/configs/${configId}/generate`, { method: "POST" }),
+  sendIssue: (issueId, emails) =>
+    request(`/api/issues/${issueId}/send`, { method: "POST", body: { emails } }),
 };

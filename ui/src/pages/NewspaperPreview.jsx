@@ -6,6 +6,7 @@ import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { statusClasses, isActiveStatus } from "@/lib/status";
+import { SendIssueForm } from "./IssueDetails";
 
 export default function NewspaperPreview() {
   const { id } = useParams();
@@ -114,6 +115,17 @@ export default function NewspaperPreview() {
             finishes.
           </p>
         </div>
+      )}
+
+      {ready && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Send this issue</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <SendIssueForm issueId={id} />
+          </CardContent>
+        </Card>
       )}
 
       {ready && (

@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Trash2, Plus, ArrowLeft, Save, Play, ExternalLink } from "lucide-react";
@@ -62,7 +62,13 @@ export default function ConfigEdit() {
   if (!config) return <p className="text-sm text-red-600">Config not found.</p>;
 
   return (
+    // key={config.id} forces React to remount the form when the user
+    // navigates to a different config. That resets all useState
+    // initializers with the new config's values, replacing what used
+    // to be a prop-resync useEffect (which ESLint's react-hooks/purity
+    // rule flags because it triggers cascading renders).
     <ExistingConfigForm
+      key={config.id}
       config={config}
       onSaved={() => qc.invalidateQueries({ queryKey: ["config", id] })}
       onDeleted={() => navigate("/configs")}
@@ -171,15 +177,15 @@ function ExistingConfigForm({ config, onSaved, onDeleted }) {
   const [includePuzzles, setIncludePuzzles] = useState(config.include_puzzles);
   const [active, setActive] = useState(config.active);
   const [language, setLanguage] = useState(config.language ?? "en");
+  const [newsletterEmails, setNewsletterEmails] = useState(
+    (config.newsletter_emails ?? []).join(", "),
+  );
   const [error, setError] = useState(null);
 
-  useEffect(() => {
-    setName(config.name);
-    setSchedule(scheduleFromConfig(config));
-    setIncludePuzzles(config.include_puzzles);
-    setActive(config.active);
-    setLanguage(config.language ?? "en");
-  }, [config]);
+  // State initializers above pull from `config` on mount. The parent
+  // passes `key={config.id}`, so navigating to a different config
+  // remounts this component and re-runs initializers, replacing the
+  // prop-resync useEffect that react-hooks/purity flags.
 
   const save = useMutation({
     mutationFn: (data) => api.updateConfig(config.id, data),
@@ -200,11 +206,16 @@ function ExistingConfigForm({ config, onSaved, onDeleted }) {
 
   function submit() {
     setError(null);
+    const parsedEmails = newsletterEmails
+      .split(",")
+      .map((e) => e.trim())
+      .filter(Boolean);
     save.mutate({
       name: name.trim(),
       include_puzzles: includePuzzles,
       active,
       language,
+      newsletter_emails: parsedEmails,
       ...pickSchedulePayload(schedule),
     });
   }
@@ -262,6 +273,20 @@ function ExistingConfigForm({ config, onSaved, onDeleted }) {
             <p className="text-xs text-muted-foreground">
               Drafts + editorial will be written in this language, translated from multilingual
               sources as needed.
+            </p>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label htmlFor="newsletter-emails">Newsletter emails</Label>
+            <Input
+              id="newsletter-emails"
+              value={newsletterEmails}
+              onChange={(e) => setNewsletterEmails(e.target.value)}
+              placeholder="alice@example.com, bob@example.com"
+            />
+            <p className="text-xs text-muted-foreground">
+              Comma-separated. After each successful run, a PDF of the issue is emailed to this
+              list. Leave empty to disable delivery for this config.
             </p>
           </div>
 
@@ -463,12 +488,10 @@ function TopicRow({ topic, onChange }) {
   const [feedUrl, setFeedUrl] = useState("");
   const [dirty, setDirty] = useState(false);
 
-  useEffect(() => {
-    setName(topic.name);
-    setSourcesText(topic.preferred_sources.join(", "));
-    setHints(topic.search_hints ?? "");
-    setDirty(false);
-  }, [topic]);
+  // Parent renders `<TopicRow key={t.id} ...>` so a new topic id remounts
+  // this row and the initializers above pull fresh values. No prop-resync
+  // useEffect needed; keeping one made ESLint's react-hooks/purity
+  // unhappy and overwrote user edits after auto-save refetches.
 
   const save = useMutation({
     mutationFn: (data) => api.updateTopic(topic.id, data),

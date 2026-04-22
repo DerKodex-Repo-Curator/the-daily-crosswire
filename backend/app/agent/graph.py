@@ -1,42 +1,16 @@
 import logging
 import time
-import uuid
 from functools import lru_cache
-from typing import Any
 
 from langgraph.graph import END, START, StateGraph
-from sqlmodel import Session
 
 from app.agent import nodes
+from app.agent.checkpoint import checkpoint_meta
 from app.agent.state import AgentState
-from app.db import engine
-from app.models import Issue
+from app.services import log_buffer
 from app.utils.time import now_utc
 
 logger = logging.getLogger(__name__)
-
-
-def _checkpoint_meta(issue_id: str, meta: dict[str, Any]) -> None:
-    """Flush the current in-memory meta snapshot to issues.drafts_json.
-    Writes are best-effort; a DB hiccup mid-run must not kill the agent.
-
-    This is what drives the live generation dashboard. The finalize node
-    still writes the authoritative drafts_json at the end; this merges
-    the live meta over whatever is there so partial state (current_node,
-    completed_nodes, timings so far, drop_trace so far) shows up in the UI
-    while the run is still in flight."""
-    try:
-        with Session(engine) as s:
-            issue = s.get(Issue, uuid.UUID(issue_id))
-            if issue is None:
-                return
-            existing = dict(issue.drafts_json or {})
-            existing["meta"] = dict(meta)
-            issue.drafts_json = existing
-            s.add(issue)
-            s.commit()
-    except Exception:
-        logger.exception("checkpoint_meta failed for issue %s", issue_id)
 
 
 def _timed(name: str, fn):
@@ -46,7 +20,12 @@ def _timed(name: str, fn):
     At entry: record current_node + node_started_at and checkpoint so the
     UI sees which step is running.
     At exit:  record timing + append to completed_nodes and checkpoint
-    again so the UI catches progress even if the next node is slow."""
+    again so the UI catches progress even if the next node is slow.
+
+    Also flushes the in-memory log buffer to the issue_logs table at both
+    boundaries. That way, even if _evict_stale() wipes the ring during a
+    long silent window, the /logs endpoint can still serve the full
+    history from the DB fallback."""
 
     async def wrapper(state: AgentState) -> AgentState:
         issue_id = state.get("issue_id") if isinstance(state, dict) else None
@@ -54,7 +33,8 @@ def _timed(name: str, fn):
         if issue_id:
             meta_in["current_node"] = name
             meta_in.setdefault("node_started_at", {})[name] = now_utc().isoformat()
-            _checkpoint_meta(issue_id, meta_in)
+            checkpoint_meta(issue_id, meta_in)
+            log_buffer.flush_to_db(issue_id)
 
         t0 = time.perf_counter()
         result = await fn(state)
@@ -66,12 +46,13 @@ def _timed(name: str, fn):
             completed = meta.setdefault("completed_nodes", [])
             if name not in completed:
                 completed.append(name)
-            # Clear current_node when render finishes; otherwise the next
-            # node's entry wrapper will overwrite it.
-            if name == "render":
+            # Clear current_node when the last node (notify) finishes;
+            # otherwise the next node's entry wrapper will overwrite it.
+            if name == "notify":
                 meta["current_node"] = None
             if issue_id:
-                _checkpoint_meta(issue_id, meta)
+                checkpoint_meta(issue_id, meta)
+                log_buffer.flush_to_db(issue_id)
         return result
 
     wrapper.__name__ = f"timed_{name}"
@@ -92,6 +73,7 @@ def _build_graph() -> StateGraph:
     g.add_node("puzzles", _timed("puzzles", nodes.puzzles))
     g.add_node("finalize", _timed("finalize", nodes.finalize))
     g.add_node("render", _timed("render", nodes.render))
+    g.add_node("notify", _timed("notify", nodes.notify))
 
     g.add_edge(START, "ingest_rss")
     g.add_edge("ingest_rss", "ingest_search")
@@ -104,7 +86,8 @@ def _build_graph() -> StateGraph:
     g.add_edge("editorial", "puzzles")
     g.add_edge("puzzles", "finalize")
     g.add_edge("finalize", "render")
-    g.add_edge("render", END)
+    g.add_edge("render", "notify")
+    g.add_edge("notify", END)
 
     return g
 

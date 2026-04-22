@@ -31,6 +31,13 @@ class NewspaperConfig(SQLModel, table=True):
     # ISO 639-1 code: "en", "es", "fr", "it", "pt", "de". Drives draft +
     # editorial output language and template string localization.
     language: str = Field(default="en")
+    # Email addresses that receive a PDF of the generated issue after
+    # every successful render. Empty list disables delivery for this
+    # config. Validated as EmailStr at the API boundary (schemas.py).
+    newsletter_emails: list[str] = Field(
+        default_factory=list,
+        sa_column=Column(ARRAY(sa.Text), nullable=False, server_default="{}"),
+    )
     created_at: datetime = Field(default_factory=now_utc)
     updated_at: datetime = Field(default_factory=now_utc)
 
@@ -87,6 +94,14 @@ class NewsItem(SQLModel, table=True):
     source_domain: Optional[str] = Field(default=None, index=True)
     published_at: Optional[datetime] = Field(default=None, index=True)
     topic_id: Optional[uuid.UUID] = Field(default=None, foreign_key="topics.id")
+    # How this item was discovered. Populated at insert time by the
+    # ingester. Legacy rows stay null; the drops UI renders no source
+    # line for them.
+    ingested_via: Optional[str] = Field(default=None, sa_column=Column(sa.String(length=16)))
+    # RSS feed URL that produced this row (only when ingested_via='rss').
+    source_feed_url: Optional[str] = Field(default=None, sa_column=Column(sa.Text))
+    # SearXNG query text that produced this row (only when ingested_via='searxng').
+    source_query: Optional[str] = Field(default=None, sa_column=Column(sa.Text))
     embedding: Optional[list[float]] = Field(
         default=None,
         sa_column=Column(Vector(EMBED_DIM), nullable=True),

@@ -2,7 +2,7 @@ import uuid
 from datetime import date, datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
 
 class FeedRead(BaseModel):
@@ -76,6 +76,7 @@ class ConfigRead(BaseModel):
     active: bool
     max_stories_per_topic: Optional[int] = None
     language: LanguageCode = "en"
+    newsletter_emails: list[EmailStr] = []
     created_at: datetime
     updated_at: datetime
     topics: list[TopicRead] = []
@@ -108,6 +109,7 @@ class ConfigCreate(BaseModel):
     active: bool = True
     max_stories_per_topic: Optional[int] = Field(default=None, ge=1, le=50)
     language: LanguageCode = "en"
+    newsletter_emails: list[EmailStr] = []
 
     @model_validator(mode="after")
     def _check_schedule(self):
@@ -125,6 +127,28 @@ class ConfigUpdate(BaseModel):
     active: Optional[bool] = None
     max_stories_per_topic: Optional[int] = Field(default=None, ge=1, le=50)
     language: Optional[LanguageCode] = None
+    newsletter_emails: Optional[list[EmailStr]] = None
+
+
+class IssueSendRequest(BaseModel):
+    """Ad-hoc send of a ready issue to a one-off recipient list. Distinct
+    from the per-config newsletter which fires automatically at notify
+    time."""
+
+    emails: list[EmailStr] = Field(min_length=1)
+
+
+class RecipientOutcome(BaseModel):
+    email: str
+    status: Literal["ok", "failed"]
+    error: Optional[str] = None
+
+
+class IssueSendResponse(BaseModel):
+    issue_id: uuid.UUID
+    sent: int
+    failed: int
+    per_recipient: list[RecipientOutcome]
 
 
 class IssueListItem(BaseModel):

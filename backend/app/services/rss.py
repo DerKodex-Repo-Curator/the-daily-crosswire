@@ -76,6 +76,8 @@ def poll_feed(session: Session, feed: RSSFeed) -> int:
             source_domain=urlparse(url).netloc or None,
             published_at=_parse_published(entry),
             topic_id=feed.topic_id,
+            ingested_via="rss",
+            source_feed_url=feed.url,
         )
         session.add(item)
         added += 1

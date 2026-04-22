@@ -1,13 +1,20 @@
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
+from app.config import settings
 from app.db import get_session
 from app.models import Issue, NewspaperConfig, Topic
-from app.schemas import IssueDetail, IssueListItem
+from app.schemas import (
+    IssueDetail,
+    IssueListItem,
+    IssueSendRequest,
+    IssueSendResponse,
+    RecipientOutcome,
+)
 from app.services import log_buffer
 
 router = APIRouter(prefix="/api/issues", tags=["issues"])
@@ -178,25 +185,129 @@ def get_issue_logs(
     """Poll-based log tail for the dashboard Logs tab.
 
     Two-tier storage:
-    - **In-memory ring buffer** (10-min TTL, 500-entry cap) for live and
+    - **In-memory ring buffer** (30-min TTL, 500-entry cap) for live and
       recently-finished runs. Fast; wiped on backend restart.
-    - **issue_logs table** as the persistent fallback. At the end of
-      every run_issue() the buffer is flushed here, so historical runs
-      still have their tail even after a backend reload.
+    - **issue_logs table** as the persistent record. flush_to_db() runs at
+      every node boundary during a live run (plus select sub-steps), so
+      older entries survive even if _evict_stale() wipes the ring during
+      a quiet window.
 
-    We try the in-memory buffer first (it's freshest, includes records
-    that haven't been flushed yet), and fall back to the DB only if
-    memory is empty. Issues with no logs in either place return an empty
-    list rather than a 404."""
-    entries = log_buffer.tail(str(issue_id), since=since)
-    source = "memory"
-    if not entries:
-        entries = log_buffer.load_from_db(str(issue_id), since=since)
-        source = "db" if entries else "empty"
+    Returns the union of both sources, deduplicated by (ts, msg) and sorted
+    by ts. Memory is freshest, DB has the durable tail. An issue with no
+    logs in either place returns an empty list rather than a 404."""
+    mem_entries = log_buffer.tail(str(issue_id), since=since)
+    db_entries = log_buffer.load_from_db(str(issue_id), since=since)
+
+    if mem_entries and db_entries:
+        seen: set[tuple[str, str]] = set()
+        merged: list[dict[str, Any]] = []
+        # DB first; memory appended second overrides duplicates via the set.
+        for e in db_entries:
+            key = (e.get("ts", ""), e.get("msg", ""))
+            if key not in seen:
+                seen.add(key)
+                merged.append(e)
+        for e in mem_entries:
+            key = (e.get("ts", ""), e.get("msg", ""))
+            if key not in seen:
+                seen.add(key)
+                merged.append(e)
+        merged.sort(key=lambda e: e.get("ts", ""))
+        entries: list[dict[str, Any]] = merged
+        source = "merged"
+    elif mem_entries:
+        entries = mem_entries
+        source = "memory"
+    elif db_entries:
+        entries = db_entries
+        source = "db"
+    else:
+        entries = []
+        source = "empty"
+
     return {
         "issue_id": str(issue_id),
         "entries": entries,
         "count": len(entries),
         "source": source,
-        "server_time": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+        # tz-aware datetime so the ISO string carries `+00:00`, matching
+        # the shape of both in-memory buffer entries and DB-loaded entries.
+        # Not using the project's `now_utc()` helper here because it strips
+        # tzinfo for the naive-timestamp columns used elsewhere; this value
+        # is a response field, not a DB write.
+        "server_time": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
     }
+
+
+@router.post("/{issue_id}/send", response_model=IssueSendResponse)
+async def send_issue(
+    issue_id: uuid.UUID,
+    payload: IssueSendRequest,
+    session: Session = Depends(get_session),
+) -> IssueSendResponse:
+    """Ad-hoc delivery of an already-generated issue to a one-off recipient
+    list. Distinct from the per-config newsletter which fires automatically
+    via the notify node. Synchronous: blocks until SMTP returns so the UI
+    can show per-recipient outcomes immediately."""
+    issue = session.get(Issue, issue_id)
+    if issue is None:
+        raise HTTPException(status_code=404, detail="issue not found")
+    if issue.status != "ready" or not issue.html_path:
+        raise HTTPException(
+            status_code=409,
+            detail=f"issue is not ready (status={issue.status!r}); cannot send",
+        )
+    if not settings.smtp_configured:
+        raise HTTPException(status_code=503, detail="SMTP not configured")
+
+    # De-dupe while preserving order.
+    seen: set[str] = set()
+    recipients: list[str] = []
+    for e in payload.emails:
+        email = str(e).strip()
+        if email and email not in seen:
+            seen.add(email)
+            recipients.append(email)
+    if not recipients:
+        raise HTTPException(status_code=400, detail="no valid recipients")
+
+    config = session.get(NewspaperConfig, issue.config_id)
+    paper_name = config.name if config else "The Daily Crosswire"
+    language = config.language if config else "en"
+
+    try:
+        from app.services import mail as mail_service
+        from app.services import pdf as pdf_service
+
+        pdf_bytes = await pdf_service.build_issue_pdf(issue.slug)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"pdf generation failed: {type(exc).__name__}: {exc}",
+        )
+
+    payload_email = mail_service.build_issue_email(
+        paper_name=paper_name,
+        issue_date=issue.issue_date,
+        language=language,
+        slug=issue.slug,
+        pdf_bytes=pdf_bytes,
+        kind="adhoc",
+    )
+
+    try:
+        outcomes = await mail_service.send_issue(recipients, payload_email)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"smtp transport failed: {type(exc).__name__}: {exc}",
+        )
+
+    sent = sum(1 for o in outcomes if o.get("status") == "ok")
+    failed = sum(1 for o in outcomes if o.get("status") == "failed")
+    return IssueSendResponse(
+        issue_id=issue_id,
+        sent=sent,
+        failed=failed,
+        per_recipient=[RecipientOutcome(**o) for o in outcomes],
+    )

@@ -15,7 +15,9 @@ A self-hosted web app that generates a small, print-ready newspaper on a
 schedule. You define the topics and sources; an LLM agent ingests RSS
 feeds and web search results, deduplicates against past runs, writes tight
 cause-and-effect stories, assembles a themed puzzles page, and renders an
-HTML issue you can open in the browser or save as a PDF via Cmd+P.
+HTML issue you can open in the browser or save as a PDF via Cmd+P. If you
+subscribe email addresses to the config, every successful run also mails
+a PDF to the list automatically.
 
 
 ## What it does
@@ -51,15 +53,23 @@ HTML issue you can open in the browser or save as a PDF via Cmd+P.
   9. Renders the final HTML at `issues/{slug}/index.html` with a print-ready
      stylesheet, localized to the config's chosen language (date format,
      masthead strings, editorial label, etc.).
+  10. Mails a PDF of the rendered issue to `config.newsletter_emails` via
+      SMTP. Playwright renders the same HTML through headless Chromium so
+      the attachment matches what Cmd+P would save. Runs per recipient so
+      per-recipient outcomes are recorded in `meta.notify`. Skipped cleanly
+      when the list is empty or SMTP is not configured.
 - **Every drop is traced.** Each candidate that didn't make it into the
   paper (dropped by cross-issue dedup, quality filter, intra-issue dedup,
   or per-topic cap) lands in `meta.drop_trace` with the stage, a short
   reason (the LLM writes its own for select and dedup), and a denormalized
   snapshot of the source so it stays readable even if the source news_items
-  row is garbage-collected later.
+  row is garbage-collected later. Drops include the item's `published_at`
+  and ingestion origin (RSS feed URL or SearXNG query) when available.
 - **You browse.** The web UI lists past issues with date/config/status
   filters, previews each one in an iframe, and has:
   - a one-click **Print / Save as PDF**;
+  - an ad-hoc **Send this issue** form next to the print button for
+    emailing a ready issue to a one-off recipient list;
   - a **Details dashboard** per issue with six tabs: Overview, Pipeline,
     Drops, Timings, Logs, Run info. **Live while the run is in
     progress:** the dashboard shows the current node, elapsed time per
@@ -91,8 +101,9 @@ agent runs end-to-end from one click, with no need to wait for the scheduler.
 │  (Vite)    │      │ ├── REST API (configs, issues)        │      │ + pgvector │
 │            │◀─────│ ├── APScheduler (per-config triggers) │      └────────────┘
 └────────────┘      │ ├── RSS ingester + dedup + renderer   │
-      ▲             │ ├── LangGraph agent (11 nodes)        │─────▶ SearXNG
-      │             │ └── /issues/{slug}/ static mount      │       (self-hosted)
+      ▲             │ ├── LangGraph agent (12 nodes)        │─────▶ SearXNG
+      │             │ ├── Playwright PDF + SMTP delivery    │       (self-hosted)
+      │             │ └── /issues/{slug}/ static mount      │
       │             └──────────────────────────────────────┘             │
       └── iframes /issues/{slug}/index.html for preview                  │
                                                                          ▼
@@ -165,8 +176,14 @@ These are baked in and earned their place through testing + use:
   generator can't prove it, the run fails loudly.
 - **No hype words, no superlatives, no exclamation marks, no emoji in
   any user-facing copy.** The voice is straight news.
-- **Cmd+P is the PDF step.** No Puppeteer, no Playwright, no headless
-  browser. Browser print dialogue handles it.
+- **Cmd+P is the primary PDF step for interactive users.** A headless
+  Chromium via Playwright exists in one place only:
+  [backend/app/services/pdf.py](backend/app/services/pdf.py), used by the
+  newsletter delivery path so the emailed attachment matches what
+  Cmd+P would save.
+- **Newsletter delivery via SMTP.** Per-config recipient list fires
+  automatically on every successful render; the preview page also
+  exposes an ad-hoc send to a one-off list.
 
 ## License
 

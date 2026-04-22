@@ -76,5 +76,21 @@ class Settings(BaseSettings):
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_allowed_origins.split(",") if o.strip()]
 
+    # SMTP settings for the notify node and the ad-hoc /send endpoint.
+    # Leave any required field blank to disable delivery (notify records
+    # status='misconfigured', ad-hoc /send returns 503). Works with any
+    # plain-SMTP provider: Gmail app password, Fastmail, self-hosted,
+    # MailHog for local testing.
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    smtp_use_tls: bool = True
+
+    @property
+    def smtp_configured(self) -> bool:
+        return bool(self.smtp_host and self.smtp_from)
+
 
 settings = Settings()

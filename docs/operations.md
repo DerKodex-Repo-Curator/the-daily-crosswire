@@ -145,7 +145,7 @@ What's there:
 - **Overview**:
   - While a run is active, a "Generation in progress" banner with the
     current node, per-step elapsed, and completed/total step counter.
-  - A **Pipeline Progress** grid for all 11 nodes: green check for
+  - A **Pipeline Progress** grid for all 12 nodes: green check for
     completed (with the stored duration), blue spinner for in-flight
     (with live elapsed ticking), grey for pending.
   - The count **funnel** and the per-topic breakdown.
@@ -382,6 +382,58 @@ wall clock, use a faster model. If embeddings dominate, you may be
 re-embedding every run (shouldn't be; `embed` only fills in missing
 vectors). Check `news_items.embedding IS NULL` counts over time; they
 should trend to zero.
+
+### Newsletter delivery
+
+Delivery state for a run lives in `meta.notify` on the issue's
+`drafts_json`. The Run info tab of the Details dashboard renders it as a
+"Delivery" card.
+
+Expected statuses and what they mean:
+
+- `ok`: all recipients received the PDF.
+- `partial`: at least one recipient failed; `per_recipient` lists each
+  outcome with the SMTP error.
+- `skipped`: either `config.newsletter_emails` is empty (reason "no
+  subscribers") or the issue isn't ready (reason "issue not ready").
+- `misconfigured`: SMTP env vars aren't set; notify didn't attempt a send.
+- `failed`: PDF generation or SMTP transport threw before per-recipient
+  loop; `error` has the exception string.
+
+Common failure modes:
+
+- **Connection refused / timeout**: SMTP host unreachable from the
+  backend container. Check `SMTP_HOST` resolves inside the container
+  (`docker compose exec backend getent hosts <host>`). For a MailHog
+  running on the Mac host, use `host.docker.internal`, not `localhost`.
+- **Auth failure**: for Gmail, confirm you're using an app password, not
+  the account password, and that 2FA is on. For Fastmail, confirm the app
+  password isn't limited by folder permissions.
+- **TLS handshake**: `SMTP_USE_TLS=true` issues STARTTLS; MailHog and
+  some local servers don't support it. Set `SMTP_USE_TLS=false` for
+  plain-text local testing.
+- **Rate limits**: Gmail caps at ~500 recipients/day; hitting it returns
+  a 421/454 response and per-recipient `failed` outcomes. Space out
+  runs or use a provider without such caps.
+- **Chromium fails to launch inside the container**: happens if the
+  Dockerfile `playwright install chromium --with-deps` step was skipped
+  or a newer image layer cached before that line. Rebuild with
+  `docker compose build --no-cache backend`.
+
+### Ad-hoc send
+
+`POST /api/issues/{id}/send` with `{"emails": [...]}` is exposed via the
+Send button on the preview page and the Run info tab. Response shape
+matches `meta.notify.per_recipient`. Returns:
+
+- `200` with `{sent, failed, per_recipient}` on happy + partial paths.
+- `404` if the issue id doesn't exist.
+- `409` if the issue isn't in `ready` state (can't send a failed or
+  in-flight issue).
+- `422` for empty or invalid email lists (caught by Pydantic
+  `EmailStr` validation).
+- `503` when `SMTP_HOST`/`SMTP_FROM` are blank.
+- `500` if PDF generation or SMTP transport raises.
 
 ## What's not here yet
 

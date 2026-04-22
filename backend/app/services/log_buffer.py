@@ -30,14 +30,31 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Optional
 
-_MAX_ENTRIES = 500
-_BUFFER_TTL_SECONDS = 600  # 10 minutes after last write
+_MAX_ENTRIES = 2000
+_BUFFER_TTL_SECONDS = 1800  # 30 minutes after last write. The long LLM-heavy
+# nodes (select, draft) can go many minutes between log lines on local qwen3,
+# and _evict_stale() only fires on reads. A 10-min TTL wiped the buffer when
+# the Logs tab happened to be polled during a quiet window. The real
+# durability guarantee is the incremental DB flush below; this just keeps the
+# in-memory path alive for normal use.
+#
+# _MAX_ENTRIES is sized for the busiest realistic node (draft with ~30 stories
+# plus critique on all of them), with headroom so the deque's bounded
+# eviction doesn't silently drop lines between flush_to_db() points.
 
 _current_issue: ContextVar[Optional[str]] = ContextVar("_current_issue", default=None)
 
 # Each entry: {"ts": iso, "level": "INFO", "logger": "app.agent.nodes", "msg": "..."}
 _BUFFERS: dict[str, deque] = {}
 _LAST_WRITE: dict[str, float] = {}
+# How many entries of each buffer have already been persisted to issue_logs.
+# Used by flush_to_db() to skip rows already written, so repeated flushes
+# during a live run don't create duplicate DB rows.
+_FLUSH_CURSOR: dict[str, int] = {}
+# Total number of entries ever appended per issue (not bounded by _MAX_ENTRIES).
+# The cursor compares against this rather than len(buffer) so the bounded
+# deque's eviction doesn't confuse the math.
+_APPEND_COUNT: dict[str, int] = {}
 _LOCK = threading.Lock()
 
 
@@ -118,6 +135,7 @@ class IssueLogHandler(logging.Handler):
                 _BUFFERS[iid] = buf
             buf.append(entry)
             _LAST_WRITE[iid] = time.monotonic()
+            _APPEND_COUNT[iid] = _APPEND_COUNT.get(iid, 0) + 1
 
 
 def set_current_issue(issue_id: Optional[str]) -> None:
@@ -129,11 +147,20 @@ def start_buffer(issue_id: str) -> None:
         if issue_id not in _BUFFERS:
             _BUFFERS[issue_id] = deque(maxlen=_MAX_ENTRIES)
         _LAST_WRITE[issue_id] = time.monotonic()
+        _FLUSH_CURSOR.setdefault(issue_id, 0)
+        _APPEND_COUNT.setdefault(issue_id, 0)
 
 
 def tail(issue_id: str, since: Optional[str] = None) -> list[dict]:
     """Return entries newer than `since` (ISO timestamp, exclusive),
-    or all entries if `since` is None. Also runs the lazy TTL sweep."""
+    or all entries if `since` is None. Also runs the lazy TTL sweep.
+
+    Invariant: the `since` comparison is a lexicographic string compare.
+    That is correct iff every entry's `ts` uses the same shape: ISO-8601
+    UTC with millisecond precision and a `+00:00` suffix. Both producers
+    (the `emit()` above and `load_from_db()` below) honor that, so the
+    strings sort in chronological order. If a new producer gets added,
+    keep that shape or this filter will silently return wrong rows."""
     _evict_stale()
     with _LOCK:
         buf = _BUFFERS.get(issue_id)
@@ -152,14 +179,24 @@ def _evict_stale() -> None:
             if now - _LAST_WRITE.get(iid, 0) > _BUFFER_TTL_SECONDS:
                 _BUFFERS.pop(iid, None)
                 _LAST_WRITE.pop(iid, None)
+                _FLUSH_CURSOR.pop(iid, None)
+                _APPEND_COUNT.pop(iid, None)
 
 
 def flush_to_db(issue_id: str) -> int:
-    """Persist the in-memory buffer for this issue to the issue_logs
-    table. Called from runner.run_issue()'s finally block so logs
-    survive the backend reloads + buffer TTL that wipe the in-memory
-    copy. Safe to call on an empty buffer (no-op). Returns the number
-    of rows inserted."""
+    """Persist unflushed entries of the in-memory buffer to the issue_logs
+    table. Safe to call repeatedly during a live run: a per-issue cursor
+    tracks how many entries have already been written and only new ones
+    get inserted.
+
+    Called from:
+    - runner.run_issue()'s finally block (final flush before buffer TTL
+      eviction)
+    - graph._timed at every node entry/exit (incremental during the run)
+    - nodes.py at sub-step boundaries inside select (the longest node)
+
+    Returns the number of rows inserted on this call. Safe to call on an
+    empty or fully-flushed buffer (no-op, returns 0)."""
     import uuid as _uuid
     from datetime import datetime as _dt
     from sqlmodel import Session as _Session
@@ -167,8 +204,30 @@ def flush_to_db(issue_id: str) -> int:
     from app.models import IssueLog
 
     with _LOCK:
-        entries = list(_BUFFERS.get(issue_id, ()))
+        buf = _BUFFERS.get(issue_id)
+        if buf is None:
+            return 0
+        append_count = _APPEND_COUNT.get(issue_id, 0)
+        cursor = _FLUSH_CURSOR.get(issue_id, 0)
+        pending = append_count - cursor
+        if pending <= 0:
+            return 0
+        # The deque is bounded: if the buffer lost entries to its maxlen
+        # cap before we could flush them, we can't recover them. Flush
+        # whatever tail is still in memory and advance the cursor to
+        # append_count anyway so we don't re-try those missing indices.
+        tail_count = min(pending, len(buf))
+        entries = list(buf)[-tail_count:] if tail_count > 0 else []
+        # Snapshot the target cursor now so concurrent emits after we
+        # release the lock land in "future pending" territory, not in
+        # "already flushed".
+        new_cursor = append_count
+
     if not entries:
+        # Happens only when the deque got wiped but append_count moved on.
+        # Advance cursor so we don't keep coming back here.
+        with _LOCK:
+            _FLUSH_CURSOR[issue_id] = new_cursor
         return 0
 
     try:
@@ -181,7 +240,13 @@ def flush_to_db(issue_id: str) -> int:
         try:
             ts = _dt.fromisoformat(e["ts"])
         except Exception:
-            ts = _dt.utcnow()
+            # Unreachable in normal use (emit() always writes a valid ISO
+            # ts). The fallback must be tz-aware UTC because the
+            # IssueLog.ts column is DateTime(timezone=True). Using
+            # `datetime.now(timezone.utc)` directly here instead of the
+            # project's `now_utc()` helper, which strips tzinfo for
+            # compatibility with the naive-timestamp columns elsewhere.
+            ts = datetime.now(timezone.utc)
         rows.append(
             IssueLog(
                 issue_id=iid,
@@ -204,6 +269,9 @@ def flush_to_db(issue_id: str) -> int:
             issue_id,
         )
         return 0
+
+    with _LOCK:
+        _FLUSH_CURSOR[issue_id] = new_cursor
     return len(rows)
 
 

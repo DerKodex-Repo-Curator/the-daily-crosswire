@@ -15,6 +15,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
+# Headless Chromium for the newsletter PDF render (app/services/pdf.py).
+# `--with-deps` installs the OS libs Chromium needs on debian-slim.
+# This adds ~400 MB to the image; acceptable for a single-user local stack.
+RUN playwright install chromium --with-deps
+
 COPY . .
 
 EXPOSE 8000

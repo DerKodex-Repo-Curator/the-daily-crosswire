@@ -22,10 +22,10 @@ generated newspaper HTML as static files; the UI iframes it for preview.
 
 | Table                | What it holds                                                             |
 | -------------------- | ------------------------------------------------------------------------- |
-| `newspaper_configs`  | User-defined "newspapers": name, schedule, topics, active flag, optional max-stories-per-topic cap. |
+| `newspaper_configs`  | User-defined "newspapers": name, schedule, topics, active flag, optional max-stories-per-topic cap, plus `newsletter_emails` (list of recipient addresses for automatic delivery after each run). |
 | `topics`             | Beats attached to a config: name, preferred domains, free-text search hints. |
 | `rss_feeds`          | Per-topic RSS URLs, with etag + last-modified for cheap conditional polls. |
-| `news_items`         | Ingested stories (URL-unique). Title, summary, `source_domain`, `topic_id`, `embedding vector(768)`. |
+| `news_items`         | Ingested stories (URL-unique). Title, summary, `source_domain`, `topic_id`, `embedding vector(768)`. Also captures how the item was discovered: `ingested_via` (`'rss'` or `'searxng'`), `source_feed_url` (when from a feed), `source_query` (when from web search). Legacy rows pre-source-tracking have these as null. |
 | `issues`             | One generated newspaper: status, slug, issue_date, lookback window, html_path, `drafts_json` (full pipeline state). |
 | `story_log`          | One row per drafted story per issue. Holds the rendered title, rendered body, and `rendered_title_embedding`. Semantic dedup queries against this on the next run. |
 
@@ -40,7 +40,7 @@ Foreign keys:
 pgvector indexes: `ivfflat` with `vector_cosine_ops` on both vector
 columns. Uses cosine distance (`<=>`) for similarity queries.
 
-## The agent pipeline (11 nodes)
+## The agent pipeline (12 nodes)
 
 When a config fires (on schedule or from the "Generate now" button) the
 endpoint creates a pending `issues` row, captures its id, and enqueues a
@@ -149,9 +149,21 @@ LangGraph graph. Nodes in order:
     happen in one atomic transaction. If render crashes, the issue stays
     `drafted` and can be re-rendered.
 
+12. **`notify`**: if `config.newsletter_emails` is non-empty and the issue
+    is `ready`, renders the HTML to PDF via Playwright + headless Chromium
+    ([backend/app/services/pdf.py](../backend/app/services/pdf.py)) and
+    mails it to every recipient as a multipart/alternative message with
+    attachment ([backend/app/services/mail.py](../backend/app/services/mail.py)).
+    Skips cleanly when the recipient list is empty or SMTP is unconfigured.
+    A failed send does not flip issue status; the newspaper is already
+    published. Per-recipient outcomes and the overall status land in
+    `meta.notify`.
+
 On an Apple M4 Pro with 48 GB unified RAM running qwen3:14b locally, the
 whole run takes 15-30 minutes depending on LLM latency and how many
 stories survived dedup. Hosted providers cut that by a large factor.
+The `notify` node adds a few seconds (Chromium launch + PDF render + SMTP
+round trip), independent of LLM latency.
 
 ## The lookback contract
 
@@ -248,6 +260,24 @@ language means: add it to `SUPPORTED`, fill in `_TEMPLATE_STRINGS`,
 `_MONTHS`, `_WEEKDAYS`, optionally `_HYPE_WORDS`, and the `LanguageCode`
 Literal in [backend/app/schemas.py](../backend/app/schemas.py).
 
+### PDF generation (newsletter path only)
+
+Interactive users Cmd+P the iframe preview to save a PDF. For the
+newsletter attachment the `notify` node calls
+[backend/app/services/pdf.py](../backend/app/services/pdf.py), which
+launches headless Chromium via Playwright, loads the rendered
+`issues/{slug}/index.html` via `file://` URL, and calls `page.pdf()` with
+`print_background=True` + `prefer_css_page_size=True` and zero margins.
+The existing `@page` rules in `backend/app/templates/style.css` drive
+pagination exactly as they do in Chrome under Cmd+P: named pages (news vs
+games), letter size, columns, and Google Fonts all carry over.
+
+Playwright is installed in the backend Dockerfile
+(`playwright install chromium --with-deps`); this adds ~400 MB to the
+image. Acceptable for a single-user local stack. CLAUDE.md scopes the
+rule to this one file so no other pipeline stage introduces a headless
+browser.
+
 ## Puzzle generation
 
 [backend/app/puzzles/build.py](../backend/app/puzzles/build.py) is the
@@ -325,9 +355,10 @@ Keys under `meta`:
 | `critique`       | `{checked, flagged, rewrites, failures, llm}` |
 | `editorial`      | `{status: ok/failed/skipped, word_count, error?}` |
 | `puzzles`        | `{status: ok/fallback/failed/skipped, seed, theme_pool_size, crypto_phrase_candidates}` |
+| `notify`         | `{status: ok/partial/skipped/misconfigured/failed, sent?, failed?, per_recipient?: [{email, status, error?}], reason?, error?}`. Records the automatic newsletter delivery for this run. `skipped` when no subscribers or issue not ready; `misconfigured` when SMTP is unset; `partial` when some recipients failed. |
 | `funnel`         | Flat pipeline counts: `ingested_new -> embedded_candidates -> after_cross_dedup -> after_select_and_intra_dedup -> drafted -> editorial_ok / puzzles_status` |
 | `drop_trace`     | List of every dropped candidate. See below. |
-| `current_node`   | Name of the node currently in flight, or null after render completes. Set on node entry, cleared on render exit. |
+| `current_node`   | Name of the node currently in flight, or null after notify completes. Set on node entry, cleared on notify exit. |
 | `completed_nodes`| Append-only list of node names that have finished. Drives the green checkmarks on the Pipeline Progress panel. |
 | `node_started_at`| Map of node name to ISO timestamp of when that node started. Used by the dashboard to show live elapsed-on-this-step while a run is active. |
 | `failed_at_node` | On failure, the node that was in flight when the graph raised. |
@@ -347,10 +378,19 @@ Each drop entry:
     "title": "...",
     "url": "https://...",
     "source_domain": "showwire.example",
-    "summary": "first 300 chars of the original summary"
+    "summary": "first 300 chars of the original summary",
+    "published_at": "2026-04-22T14:00:00+00:00",
+    "ingested_via": "rss",
+    "source_feed_url": "https://example.com/feed.xml",
+    "source_query": null
   }
 }
 ```
+
+`snapshot` carries a denormalized copy of the `news_items` row so drops
+stay legible even if the source row is garbage-collected later. Legacy
+drops (written before source tracking landed) don't have the last three
+fields; the UI omits the "via ..." line for those.
 
 Stages and their reason sources:
 

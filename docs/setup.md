@@ -68,6 +68,12 @@ key inline. The important ones:
 | `OLLAMA_API_BASE`       | _(empty)_                                       | Optional: when both this and `OLLAMA_MODEL` are set, the agent switches to `langchain-ollama` native tool calling instead of the OpenAI-compat shim. Should NOT include `/v1`. Example: `http://host.docker.internal:11434`. |
 | `OLLAMA_MODEL`          | _(empty)_                                       | Ollama model tag, e.g. `qwen3:14b`. Only used when `OLLAMA_API_BASE` is also set. |
 | `RSS_POLL_INTERVAL_HOURS` | `1`                                           | How often the global RSS poller runs. etag/modified make repeat polls cheap. |
+| `SMTP_HOST`             | _(empty)_                                       | SMTP server hostname for newsletter delivery. Leave blank to disable delivery (notify records `status: misconfigured`, `/api/issues/{id}/send` returns 503). |
+| `SMTP_PORT`             | `587`                                           | SMTP server port. 587 for STARTTLS, 465 for implicit TLS (set `SMTP_USE_TLS=false` in that case and use a TLS-only client if needed). |
+| `SMTP_USER`             | _(empty)_                                       | SMTP auth username. Leave blank for open relays (MailHog, unauthenticated local SMTP). |
+| `SMTP_PASSWORD`         | _(empty)_                                       | SMTP auth password. For Gmail, use an app password. |
+| `SMTP_FROM`             | _(empty)_                                       | `From:` address on outgoing emails. Required for delivery to be considered configured. |
+| `SMTP_USE_TLS`          | `true`                                          | Whether to negotiate STARTTLS after connecting. Disable for MailHog or plain SMTP test servers. |
 
 After editing `.env`, recreate the backend so the new env is loaded:
 
@@ -198,6 +204,39 @@ Existing stories will be re-embedded on the next agent run.
 7. Open the **Newspapers** tab or click through from the config page to
    preview the rendered issue. **Print / Save as PDF** uses the browser's
    native dialog.
+
+## Newsletter delivery
+
+Each config has a **Newsletter emails** field in the config editor. It's a
+comma-separated list of recipient addresses. When a run finishes and the
+issue reaches `ready`, the `notify` node renders the issue HTML to PDF via
+headless Chromium and mails it to every recipient as an attachment.
+
+Fill in the SMTP env vars in `.env` first (see the Environment variables
+table above). Any plain SMTP provider works:
+
+- **Gmail**: enable 2FA, create an app password, set `SMTP_HOST=smtp.gmail.com`,
+  `SMTP_PORT=587`, `SMTP_USER=you@gmail.com`, `SMTP_PASSWORD=<app password>`,
+  `SMTP_FROM=you@gmail.com`, `SMTP_USE_TLS=true`.
+- **Fastmail**: `SMTP_HOST=smtp.fastmail.com`, `SMTP_PORT=587`, username +
+  app password, `SMTP_USE_TLS=true`.
+- **Self-hosted** (Postfix, etc.): point `SMTP_HOST` at your mailserver,
+  any port your server listens on.
+- **Local testing**: run [MailHog](https://github.com/mailhog/MailHog) on
+  the host at port 1025, set `SMTP_HOST=host.docker.internal`,
+  `SMTP_PORT=1025`, `SMTP_USE_TLS=false`, leave user/password blank,
+  `SMTP_FROM=test@example.invalid`. MailHog captures everything in a web
+  UI so you can inspect the PDF and message headers.
+
+**Ad-hoc send.** On the preview page (`/issues/{id}`) and the Details
+dashboard's Run info tab, a small form lets you send the already-generated
+issue to a one-off list of emails. Independent of the config's newsletter
+list. Only enabled for issues in `ready` status.
+
+**Chromium image size.** `playwright install chromium --with-deps` runs
+at image-build time in `backend/Dockerfile`. The backend image grows by
+~400 MB. Acceptable for a single-user local stack; ignore if you don't
+run the newsletter.
 
 ## Ongoing behavior
 

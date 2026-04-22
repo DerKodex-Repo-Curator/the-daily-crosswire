@@ -5,6 +5,9 @@ import {
   ArrowLeft,
   AlertTriangle,
   BarChart3,
+  Check,
+  ChevronDown,
+  ChevronRight,
   Clock,
   Database,
   ExternalLink,
@@ -32,6 +35,7 @@ const PIPELINE_NODES = [
   "puzzles",
   "finalize",
   "render",
+  "notify",
 ];
 
 const STAGE_LABELS = {
@@ -359,6 +363,9 @@ function DropsView({ drops, topics }) {
             )}
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-neutral-500">
               {d.snapshot?.source_domain && <span>{d.snapshot.source_domain}</span>}
+              {d.snapshot?.published_at && (
+                <span>Published {formatDropDate(d.snapshot.published_at)}</span>
+              )}
               {d.snapshot?.url && (
                 <a
                   href={d.snapshot.url}
@@ -372,6 +379,7 @@ function DropsView({ drops, topics }) {
               )}
               <span className="font-mono text-[11px]">{d.news_item_id}</span>
             </div>
+            {renderDropOrigin(d.snapshot)}
           </div>
         ))}
       </div>
@@ -379,10 +387,43 @@ function DropsView({ drops, topics }) {
   );
 }
 
+function formatDropDate(iso) {
+  try {
+    return new Date(iso).toLocaleDateString(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+    });
+  } catch {
+    return iso;
+  }
+}
+
+function renderDropOrigin(snapshot) {
+  if (!snapshot) return null;
+  if (snapshot.ingested_via === "rss" && snapshot.source_feed_url) {
+    return (
+      <div className="text-xs text-neutral-500 truncate" title={snapshot.source_feed_url}>
+        via RSS: <span className="font-mono">{snapshot.source_feed_url}</span>
+      </div>
+    );
+  }
+  if (snapshot.ingested_via === "searxng" && snapshot.source_query) {
+    return (
+      <div className="text-xs text-neutral-500 truncate" title={snapshot.source_query}>
+        via SearXNG: <span className="italic">{snapshot.source_query}</span>
+      </div>
+    );
+  }
+  return null;
+}
+
 function useNow(enabled) {
   // Ticks every second so elapsed-time counters repaint even between
   // dashboard refetches. Cheap; only enabled while a run is active.
-  const [now, setNow] = useState(Date.now());
+  // Lazy initializer keeps Date.now() out of the render body so
+  // react-hooks/purity stays happy.
+  const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (!enabled) return;
     const t = setInterval(() => setNow(Date.now()), 1000);
@@ -694,6 +735,133 @@ export default function IssueDetails() {
               {d.lookback_start ?? "-"} → {d.lookback_end ?? "-"}
             </div>
           </Card>
+          <Card title="Delivery">
+            <DeliveryBlock notify={d.notify} />
+            {d.status === "ready" && (
+              <div className="mt-4 pt-4 border-t border-neutral-200">
+                <SendIssueForm issueId={id} />
+              </div>
+            )}
+          </Card>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DeliveryBlock({ notify }) {
+  if (!notify || !notify.status) {
+    return <EmptyData>No automatic delivery recorded for this run.</EmptyData>;
+  }
+  const { status, sent, failed, per_recipient, reason, error } = notify;
+  let pill = "bg-neutral-100 text-neutral-700 border-neutral-200";
+  let label = status;
+  if (status === "ok") {
+    pill = "bg-emerald-50 text-emerald-800 border-emerald-200";
+    label = `Sent to ${sent ?? 0} recipient${sent === 1 ? "" : "s"}`;
+  } else if (status === "partial") {
+    pill = "bg-amber-50 text-amber-800 border-amber-200";
+    label = `Sent ${sent ?? 0}, failed ${failed ?? 0}`;
+  } else if (status === "failed") {
+    pill = "bg-red-50 text-red-800 border-red-200";
+    label = "Failed";
+  } else if (status === "misconfigured") {
+    pill = "bg-red-50 text-red-800 border-red-200";
+    label = "SMTP not configured";
+  } else if (status === "skipped") {
+    pill = "bg-neutral-100 text-neutral-700 border-neutral-200";
+    label = `Skipped: ${reason ?? "unknown"}`;
+  }
+  return (
+    <div className="space-y-2 text-sm">
+      <span
+        className={`inline-flex items-center rounded-md border px-2 py-0.5 text-xs font-medium ${pill}`}
+      >
+        {label}
+      </span>
+      {error && <div className="text-xs text-red-700 font-mono">{error}</div>}
+      {per_recipient && per_recipient.length > 0 && (
+        <ul className="text-xs text-neutral-700 space-y-0.5">
+          {per_recipient.map((r, i) => (
+            <li key={i} className="flex gap-2">
+              <span
+                className={`font-mono ${r.status === "ok" ? "text-emerald-700" : "text-red-700"}`}
+              >
+                {r.status === "ok" ? "✓" : "✗"}
+              </span>
+              <span>{r.email}</span>
+              {r.error && <span className="text-red-700 italic">{r.error}</span>}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+export function SendIssueForm({ issueId }) {
+  const [emails, setEmails] = useState("");
+  const [sending, setSending] = useState(false);
+  const [result, setResult] = useState(null);
+  const [err, setErr] = useState(null);
+
+  async function onSend() {
+    setErr(null);
+    setResult(null);
+    const list = emails
+      .split(",")
+      .map((e) => e.trim())
+      .filter(Boolean);
+    if (list.length === 0) {
+      setErr("Enter at least one email.");
+      return;
+    }
+    setSending(true);
+    try {
+      const data = await api.sendIssue(issueId, list);
+      setResult(data);
+    } catch (e) {
+      setErr(e.message || String(e));
+    } finally {
+      setSending(false);
+    }
+  }
+
+  return (
+    <div className="space-y-2">
+      <div className="text-xs uppercase tracking-wide text-neutral-500">Send this issue to</div>
+      <div className="flex gap-2">
+        <Input
+          value={emails}
+          onChange={(e) => setEmails(e.target.value)}
+          placeholder="one@example.com, two@example.com"
+          className="flex-1"
+          disabled={sending}
+        />
+        <Button onClick={onSend} disabled={sending} size="sm">
+          {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+          Send
+        </Button>
+      </div>
+      {err && <div className="text-xs text-red-700">{err}</div>}
+      {result && (
+        <div className="text-xs text-neutral-700 space-y-1">
+          <div>
+            Sent {result.sent}, failed {result.failed}.
+          </div>
+          <ul className="space-y-0.5">
+            {result.per_recipient?.map((r, i) => (
+              <li key={i} className="flex gap-2">
+                <span
+                  className={`font-mono ${r.status === "ok" ? "text-emerald-700" : "text-red-700"}`}
+                >
+                  {r.status === "ok" ? "✓" : "✗"}
+                </span>
+                <span>{r.email}</span>
+                {r.error && <span className="text-red-700 italic">{r.error}</span>}
+              </li>
+            ))}
+          </ul>
         </div>
       )}
     </div>
@@ -750,9 +918,14 @@ function FailedBanner({ details }) {
   );
 }
 
+const NODES_WITH_SUB_DETAIL = new Set(["select", "draft", "critique", "editorial"]);
+
 function PipelineProgress({ details, now }) {
   const completed = new Set(details.completed_nodes ?? []);
   const current = details.current_node;
+  const hasSubDetail = NODES_WITH_SUB_DETAIL.has(current) && details[current]?.progress != null;
+  // Default expanded while active; user can collapse per session.
+  const [expanded, setExpanded] = useState(true);
   return (
     <Card title="Pipeline">
       <ol className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-2 text-sm">
@@ -763,20 +936,28 @@ function PipelineProgress({ details, now }) {
           const ms = details.timings?.[n];
           const startedAt = running && details.node_started_at?.[n];
           const elapsed = startedAt ? Math.max(0, now - Date.parse(startedAt)) : null;
+          const canExpand = running && NODES_WITH_SUB_DETAIL.has(n) && hasSubDetail;
           return (
             <li
               key={n}
+              onClick={canExpand ? () => setExpanded((v) => !v) : undefined}
               className={`rounded-md border px-3 py-2 flex items-center justify-between gap-2 ${
                 done
                   ? "border-emerald-200 bg-emerald-50/50"
                   : running
                     ? "border-sky-300 bg-sky-50"
                     : "border-neutral-200 bg-white"
-              }`}
+              } ${canExpand ? "cursor-pointer hover:bg-sky-100" : ""}`}
             >
               <span
-                className={`font-mono text-xs ${pending ? "text-neutral-500" : "text-neutral-900"}`}
+                className={`font-mono text-xs flex items-center gap-1 ${pending ? "text-neutral-500" : "text-neutral-900"}`}
               >
+                {canExpand &&
+                  (expanded ? (
+                    <ChevronDown className="h-3 w-3" />
+                  ) : (
+                    <ChevronRight className="h-3 w-3" />
+                  ))}
                 {n}
               </span>
               <span className="text-xs tabular-nums">
@@ -793,7 +974,160 @@ function PipelineProgress({ details, now }) {
           );
         })}
       </ol>
+      {hasSubDetail && expanded && (
+        <div className="mt-3 rounded-md border border-sky-200 bg-sky-50/40 p-3">
+          <NodeSubDetail node={current} progress={details[current].progress} now={now} />
+        </div>
+      )}
     </Card>
+  );
+}
+
+function NodeSubDetail({ node, progress, now }) {
+  if (node === "select") return <SelectProgressDetail progress={progress} now={now} />;
+  if (node === "draft") return <DraftProgressDetail progress={progress} now={now} />;
+  if (node === "critique") return <CritiqueProgressDetail progress={progress} />;
+  if (node === "editorial") return <EditorialProgressDetail progress={progress} now={now} />;
+  return null;
+}
+
+function SelectProgressDetail({ progress, now }) {
+  const perTopic = progress.per_topic ?? [];
+  const phaseStartedAt = progress.phase_started_at ? Date.parse(progress.phase_started_at) : null;
+  const phaseElapsed = phaseStartedAt ? Math.max(0, now - phaseStartedAt) : null;
+  const phaseLabel = (() => {
+    const p = progress.current_phase;
+    if (p === "batch") return `batch ${progress.current_batch}/${progress.current_batch_total}`;
+    if (p === "intra_dedup_llm") return "intra-dedup (llm)";
+    if (p === "intra_dedup_emb") return "intra-dedup (emb)";
+    return null;
+  })();
+  return (
+    <div className="space-y-1.5 text-xs">
+      <div className="flex items-center justify-between text-neutral-700">
+        <span>
+          Topics: {progress.topics_done}/{progress.topics_total}
+        </span>
+      </div>
+      <ul className="space-y-1">
+        {perTopic.map((t) => {
+          const isRunning = t.status === "running";
+          const isDone = t.status === "done";
+          return (
+            <li
+              key={t.topic_id}
+              className="flex items-center gap-2 py-0.5 border-b border-sky-100 last:border-b-0"
+            >
+              <span className="w-4 shrink-0">
+                {isDone && <Check className="h-3.5 w-3.5 text-emerald-600" />}
+                {isRunning && <Loader2 className="h-3.5 w-3.5 animate-spin text-sky-600" />}
+                {!isDone && !isRunning && <span className="text-neutral-400">-</span>}
+              </span>
+              <span className="flex-1 font-medium text-neutral-900">{t.topic_name}</span>
+              {isDone && (
+                <span className="text-neutral-600 tabular-nums">
+                  kept {t.kept}/{t.candidates} · {fmtMs(t.elapsed_ms)}
+                </span>
+              )}
+              {isRunning && (
+                <span className="text-sky-700 tabular-nums">
+                  {phaseLabel}
+                  {phaseElapsed != null && <> · {fmtMs(phaseElapsed)}</>}
+                </span>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
+function DraftProgressDetail({ progress, now }) {
+  const total = progress.stories_total ?? 0;
+  const done = progress.stories_done ?? 0;
+  const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+  const storyStartedAt = progress.story_started_at ? Date.parse(progress.story_started_at) : null;
+  const storyElapsed = storyStartedAt ? Math.max(0, now - storyStartedAt) : null;
+  return (
+    <div className="space-y-2 text-xs">
+      <div className="flex items-center justify-between">
+        <span className="text-neutral-700">
+          Stories: {done}/{total}
+        </span>
+        <span className="tabular-nums text-neutral-500">{pct}%</span>
+      </div>
+      <div className="h-1.5 w-full rounded-full bg-sky-100 overflow-hidden">
+        <div
+          className="h-full bg-sky-500 transition-[width] duration-300"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      {progress.current_story_index ? (
+        <div className="flex items-start gap-2 pt-1">
+          <Loader2 className="h-3.5 w-3.5 animate-spin text-sky-600 mt-0.5 shrink-0" />
+          <div className="flex-1">
+            <div className="text-neutral-900">
+              Story {progress.current_story_index}/{total}
+              {progress.current_topic_name && (
+                <span className="text-neutral-500"> · {progress.current_topic_name}</span>
+              )}
+            </div>
+            {progress.current_title && (
+              <div className="text-neutral-600 truncate" title={progress.current_title}>
+                {progress.current_title}
+              </div>
+            )}
+            {storyElapsed != null && (
+              <div className="text-sky-700 tabular-nums mt-0.5">{fmtMs(storyElapsed)}</div>
+            )}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function CritiqueProgressDetail({ progress }) {
+  const total = progress.drafts_total ?? 0;
+  const checked = progress.drafts_checked ?? 0;
+  const rewrites = progress.rewrites_done ?? 0;
+  return (
+    <div className="space-y-1.5 text-xs">
+      <div className="flex items-center justify-between text-neutral-700">
+        <span>
+          Checked {checked}/{total} · Rewrites {rewrites}
+        </span>
+        {progress.current_phase && (
+          <span className="rounded-md border border-sky-300 bg-sky-100 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-sky-800">
+            {progress.current_phase}
+          </span>
+        )}
+      </div>
+      {progress.current_draft_index ? (
+        <div className="text-neutral-600">
+          <Loader2 className="inline h-3 w-3 animate-spin mr-1 text-sky-600" />
+          Draft {progress.current_draft_index}/{total}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function EditorialProgressDetail({ progress, now }) {
+  const startedAt = progress.started_at ? Date.parse(progress.started_at) : null;
+  const elapsed = startedAt ? Math.max(0, now - startedAt) : null;
+  return (
+    <div className="space-y-1 text-xs">
+      <div className="flex items-center gap-2 text-neutral-700">
+        <Loader2 className="h-3.5 w-3.5 animate-spin text-sky-600" />
+        <span>
+          Writing editorial
+          {progress.topics_count ? <> for {progress.topics_count} topics</> : null}
+        </span>
+      </div>
+      {elapsed != null && <div className="text-sky-700 tabular-nums pl-5">{fmtMs(elapsed)}</div>}
+    </div>
   );
 }
 
